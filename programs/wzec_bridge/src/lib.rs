@@ -137,6 +137,51 @@ pub mod wzec_bridge {
         Ok(())
     }
 
+    /// Step 2.5: Set deposit details after enclave detection (called by enclave authority)
+    pub fn set_deposit_details(
+        ctx: Context<SetDepositDetails>,
+        deposit_id: u64,
+        amount: u64,
+        note_commitment: [u8; 32],
+    ) -> Result<()> {
+        require!(
+            ctx.accounts.enclave_authority.key() == ctx.accounts.bridge_config.enclave_authority
+                || ctx.accounts.enclave_authority.key() == ctx.accounts.bridge_config.admin,
+            BridgeError::Unauthorized
+        );
+
+        let deposit_intent = &mut ctx.accounts.deposit_intent;
+        require!(
+            deposit_intent.deposit_id == deposit_id,
+            BridgeError::InvalidDepositId
+        );
+        require!(
+            deposit_intent.status == DepositStatus::AddressGenerated as u8,
+            BridgeError::InvalidDepositStatus
+        );
+        require!(amount > 0, BridgeError::InvalidAmount);
+
+        // Prevent double-setting (security check)
+        require!(
+            deposit_intent.amount == 0,
+            BridgeError::NoteAlreadyClaimed
+        );
+
+        deposit_intent.amount = amount;
+        deposit_intent.note_commitment = note_commitment;
+        deposit_intent.status = DepositStatus::Detected as u8;
+
+        emit!(DepositDetected {
+            deposit_id,
+            amount,
+            note_commitment,
+        });
+
+        msg!("Deposit {} detected: {} zatoshis", deposit_id, amount);
+
+        Ok(())
+    }
+
     /// Step 3: Mint wZEC after enclave attestation (encrypted verification)
     pub fn mint_with_attestation(
         ctx: Context<MintWithAttestation>,
@@ -147,14 +192,19 @@ pub mod wzec_bridge {
         nonce: u128,
     ) -> Result<()> {
         let deposit_intent = &mut ctx.accounts.deposit_intent;
-        
+
         require!(
             deposit_intent.deposit_id == deposit_id,
             BridgeError::InvalidDepositId
         );
+        // Require that deposit details have been set (amount and note_commitment)
         require!(
-            deposit_intent.status == DepositStatus::AddressGenerated as u8,
+            deposit_intent.status == DepositStatus::Detected as u8,
             BridgeError::InvalidDepositStatus
+        );
+        require!(
+            deposit_intent.amount > 0,
+            BridgeError::InvalidAmount
         );
 
         ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
@@ -192,13 +242,36 @@ pub mod wzec_bridge {
             _ => return Err(BridgeError::AttestationFailed.into()),
         };
 
-        // Decrypt and extract amount and note_commitment from encrypted output
-        // In production, this would be parsed from attestation_result.ciphertexts
-        // For now, we'll add this data as account fields
+        // Extract attestation data from encrypted output
+        // The Arcium computation returns an AttestationResult with:
+        // - amount: u64
+        // - note_commitment: [u8; 32]
+        // - recipient: [u8; 32]
+        // - is_valid: bool
+
+        // For now, we need to deserialize from the ciphertexts
+        // In a production setup, you'd have proper deserialization logic here
+        // This is a placeholder that shows the intended structure
 
         let deposit_intent = &mut ctx.accounts.deposit_intent;
         let bridge_config = &ctx.accounts.bridge_config;
         let claim_tracker = &mut ctx.accounts.claim_tracker;
+
+        // TODO: Properly deserialize attestation_result to extract:
+        // - amount
+        // - note_commitment
+        // - recipient
+        // - is_valid flag
+
+        // For now, ensure amount was set by a previous step or extract from attestation
+        require!(
+            deposit_intent.amount > 0,
+            BridgeError::InvalidAmount
+        );
+
+        // Prevent double-mint: amount should only be set once
+        // This check would be redundant once we extract from attestation,
+        // but serves as a safety check
 
         // Mark note as claimed to prevent double-spend
         claim_tracker.bump = ctx.bumps.claim_tracker;
@@ -206,7 +279,7 @@ pub mod wzec_bridge {
         claim_tracker.claimed_at = Clock::get()?.unix_timestamp;
         claim_tracker.deposit_id = deposit_intent.deposit_id;
 
-        // Mint wZEC tokens
+        // Mint wZEC tokens using the amount from deposit_intent
         let seeds = &[
             b"mint-authority".as_ref(),
             &[bridge_config.mint_authority_bump],
@@ -223,7 +296,8 @@ pub mod wzec_bridge {
             signer,
         );
 
-        token::mint_to(cpi_ctx, deposit_intent.amount)?;
+        let amount = deposit_intent.amount;
+        token::mint_to(cpi_ctx, amount)?;
 
         // Update deposit status
         deposit_intent.status = DepositStatus::Minted as u8;
@@ -231,11 +305,11 @@ pub mod wzec_bridge {
         emit!(TokensMinted {
             deposit_id: deposit_intent.deposit_id,
             user: deposit_intent.user,
-            amount: deposit_intent.amount,
+            amount,
             encrypted_attestation: attestation_result.ciphertexts[0],
         });
 
-        msg!("Minted {} wZEC for deposit {}", deposit_intent.amount, deposit_intent.deposit_id);
+        msg!("Minted {} wZEC for deposit {}", amount, deposit_intent.deposit_id);
 
         Ok(())
     }
@@ -547,6 +621,29 @@ pub struct InitIntent<'info> {
 #[instruction(deposit_id: u64, unified_address: Vec<u8>)]
 pub struct SetUnifiedAddress<'info> {
     pub admin: Signer<'info>,
+
+    #[account(
+        seeds = [b"bridge-config"],
+        bump = bridge_config.bump,
+    )]
+    pub bridge_config: Account<'info, BridgeConfig>,
+
+    #[account(
+        mut,
+        seeds = [
+            b"deposit-intent",
+            deposit_intent.user.as_ref(),
+            &deposit_id.to_le_bytes()
+        ],
+        bump = deposit_intent.bump,
+    )]
+    pub deposit_intent: Account<'info, DepositIntent>,
+}
+
+#[derive(Accounts)]
+#[instruction(deposit_id: u64, amount: u64, note_commitment: [u8; 32])]
+pub struct SetDepositDetails<'info> {
+    pub enclave_authority: Signer<'info>,
 
     #[account(
         seeds = [b"bridge-config"],
@@ -935,6 +1032,13 @@ pub struct DepositIntentCreated {
 pub struct UnifiedAddressSet {
     pub deposit_id: u64,
     pub ua_length: u16,
+}
+
+#[event]
+pub struct DepositDetected {
+    pub deposit_id: u64,
+    pub amount: u64,
+    pub note_commitment: [u8; 32],
 }
 
 #[event]

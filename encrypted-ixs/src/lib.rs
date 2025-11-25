@@ -18,23 +18,38 @@ mod circuits {
         pub enclave_pubkey: [u8; 32],
     }
 
+    /// Result of attestation verification
+    pub struct AttestationResult {
+        pub amount: u64,
+        pub note_commitment: [u8; 32],
+        pub recipient: [u8; 32],
+        pub is_valid: bool,
+    }
+
     /// Verify enclave attestation (confidential)
     #[instruction]
     pub fn verify_attestation(
         input_ctxt: Enc<Shared, AttestationInput>,
-    ) -> Enc<Shared, bool> {
+    ) -> Enc<Shared, AttestationResult> {
         let input = input_ctxt.to_arcis();
-        
+
         // In production, verify:
         // 1. Enclave signature is valid
         // 2. Note commitment is unique
         // 3. Block height is recent enough
         // 4. Amount is reasonable
-        
+
         // Simplified verification for now
         let is_valid = input.amount > 0 && input.block_height > 0;
-        
-        input_ctxt.owner.from_arcis(is_valid)
+
+        let result = AttestationResult {
+            amount: input.amount,
+            note_commitment: input.note_commitment,
+            recipient: input.recipient_solana,
+            is_valid,
+        };
+
+        input_ctxt.owner.from_arcis(result)
     }
 
     // ========================================================================
