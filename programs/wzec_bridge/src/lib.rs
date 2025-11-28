@@ -1,15 +1,46 @@
 use anchor_lang::prelude::*;
-use anchor_spl::{
-    token::{self, Burn, Mint, MintTo, Token, TokenAccount},
-};
 use arcium_anchor::prelude::*;
 
-// Computation definition offsets
-const COMP_DEF_OFFSET_VERIFY_ATTESTATION: u32 = comp_def_offset("verify_attestation");
-const COMP_DEF_OFFSET_CREATE_BURN: u32 = comp_def_offset("create_burn_intent");
-const COMP_DEF_OFFSET_UPDATE_BURN: u32 = comp_def_offset("update_burn_intent");
+// Computation definition offsets for private balance operations
+const COMP_DEF_OFFSET_MINT_PRIVATE: u32 = comp_def_offset("mint_private");
+const COMP_DEF_OFFSET_TRANSFER_PRIVATE: u32 = comp_def_offset("transfer_private");
+const COMP_DEF_OFFSET_BURN_PRIVATE: u32 = comp_def_offset("burn_private");
+const COMP_DEF_OFFSET_GET_BALANCE: u32 = comp_def_offset("get_balance");
+const COMP_DEF_OFFSET_FINALIZE_WITHDRAWAL: u32 = comp_def_offset("finalize_private_withdrawal");
 
 declare_id!("HefTNtytDcQgSQmBpPuwjGipbVcJTMRHnppU9poWRXhD");
+
+// Output types from encrypted instructions
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct EncryptedData {
+    pub ciphertexts: Vec<[u8; 32]>,
+    pub nonce: u128,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct MintPrivateOutput {
+    pub field_0: EncryptedData,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct TransferPrivateOutput {
+    pub field_0: EncryptedData,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct GetBalanceOutput {
+    pub field_0: EncryptedData,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct BurnPrivateOutput {
+    pub field_0: EncryptedData,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct FinalizePrivateWithdrawalOutput {
+    pub field_0: EncryptedData,
+}
 
 #[arcium_program]
 pub mod wzec_bridge {
@@ -20,6 +51,7 @@ pub mod wzec_bridge {
     // ========================================================================
 
     /// Initialize the bridge configuration with enclave and MPC setup
+    /// Note: This version uses PRIVATE encrypted balances, not public SPL tokens
     pub fn init_bridge(
         ctx: Context<InitBridge>,
         admin: Pubkey,
@@ -31,33 +63,43 @@ pub mod wzec_bridge {
         bridge_config.bump = ctx.bumps.bridge_config;
         bridge_config.admin = admin;
         bridge_config.enclave_authority = enclave_authority;
-        bridge_config.wzec_mint = ctx.accounts.wzec_mint.key();
-        bridge_config.mint_authority_bump = ctx.bumps.mint_authority;
+        
+        // Initialize encrypted balance state (Arcium)
+        bridge_config.arcium_balance_state = ctx.accounts.arcium_balance_state.key();
+        bridge_config.balance_merkle_root = [0u8; 32];  // Empty tree initially
+        bridge_config.total_supply_commitment = [0u8; 32];  // Zero supply
+        
         bridge_config.withdrawal_nonce = 0;
         bridge_config.deposit_nonce = 0;
         bridge_config.mpc_quorum_pubkeys = mpc_quorum_pubkeys;
         bridge_config.bridge_ufvk = bridge_ufvk;
 
-        msg!("Bridge initialized");
-        msg!("wZEC Mint: {}", ctx.accounts.wzec_mint.key());
+        msg!("Bridge initialized with PRIVATE encrypted balances");
+        msg!("Arcium Balance State: {}", ctx.accounts.arcium_balance_state.key());
         msg!("Admin: {}", admin);
         msg!("Enclave Authority: {}", enclave_authority);
+        msg!("Privacy: All balances encrypted in Arcium MPC");
 
         Ok(())
     }
 
-    /// Initialize computation definitions (one-time setup)
-    pub fn init_verify_attestation_comp_def(ctx: Context<InitVerifyAttestationCompDef>) -> Result<()> {
+    /// Initialize computation definitions (one-time setup for private operations)
+    pub fn init_mint_private_comp_def(ctx: Context<InitMintPrivateCompDef>) -> Result<()> {
         init_comp_def(ctx.accounts, 0, None, None)?;
         Ok(())
     }
 
-    pub fn init_create_burn_comp_def(ctx: Context<InitCreateBurnCompDef>) -> Result<()> {
+    pub fn init_transfer_private_comp_def(ctx: Context<InitTransferPrivateCompDef>) -> Result<()> {
         init_comp_def(ctx.accounts, 0, None, None)?;
         Ok(())
     }
 
-    pub fn init_update_burn_comp_def(ctx: Context<InitUpdateBurnCompDef>) -> Result<()> {
+    pub fn init_burn_private_comp_def(ctx: Context<InitBurnPrivateCompDef>) -> Result<()> {
+        init_comp_def(ctx.accounts, 0, None, None)?;
+        Ok(())
+    }
+
+    pub fn init_get_balance_comp_def(ctx: Context<InitGetBalanceCompDef>) -> Result<()> {
         init_comp_def(ctx.accounts, 0, None, None)?;
         Ok(())
     }
@@ -137,12 +179,14 @@ pub mod wzec_bridge {
         Ok(())
     }
 
-    /// Step 3: Mint wZEC after enclave attestation (encrypted verification)
-    pub fn mint_with_attestation(
-        ctx: Context<MintWithAttestation>,
+    /// Step 3: Mint PRIVATE wZEC after enclave attestation (fully encrypted)
+    /// This updates the user's encrypted balance in Arcium, not a public token
+    pub fn mint_private_with_attestation(
+        ctx: Context<MintPrivateWithAttestation>,
         computation_offset: u64,
         deposit_id: u64,
         encrypted_attestation: [u8; 32],  // Encrypted attestation from enclave
+        encrypted_user_key: [u8; 32],     // User's encryption key
         pub_key: [u8; 32],
         nonce: u128,
     ) -> Result<()> {
@@ -159,12 +203,14 @@ pub mod wzec_bridge {
 
         ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
 
-        // Queue confidential computation to verify attestation
+        // Queue confidential computation to verify attestation AND mint private balance
         let args = vec![
             Argument::ArcisPubkey(pub_key),
             Argument::PlaintextU128(nonce),
             Argument::EncryptedU8(encrypted_attestation),
+            Argument::EncryptedU8(encrypted_user_key),
             Argument::PlaintextU64(deposit_id),
+            Argument::PlaintextBytes(deposit_intent.user.to_bytes().to_vec()),  // User pubkey
         ];
 
         queue_computation(
@@ -172,32 +218,29 @@ pub mod wzec_bridge {
             computation_offset,
             args,
             None,
-            vec![VerifyAttestationCallback::callback_ix(&[])],
+            vec![MintPrivateCallback::callback_ix(&[])],
             1,
         )?;
 
-        msg!("Attestation verification queued for deposit {}", deposit_id);
+        msg!("Private mint queued for deposit {} (fully encrypted)", deposit_id);
 
         Ok(())
     }
 
-    /// Callback after attestation is verified - actually mint the tokens
-    #[arcium_callback(encrypted_ix = "verify_attestation")]
-    pub fn verify_attestation_callback(
-        ctx: Context<VerifyAttestationCallback>,
-        output: ComputationOutputs<VerifyAttestationOutput>,
+    /// Callback after attestation is verified - update PRIVATE encrypted balance
+    /// NO PUBLIC TOKEN MINTING - balance stays encrypted in Arcium
+    #[arcium_callback(encrypted_ix = "mint_private")]
+    pub fn mint_private_callback(
+        ctx: Context<MintPrivateCallback>,
+        output: ComputationOutputs<MintPrivateOutput>,
     ) -> Result<()> {
-        let attestation_result = match output {
-            ComputationOutputs::Success(VerifyAttestationOutput { field_0 }) => field_0,
+        let balance_update = match output {
+            ComputationOutputs::Success(MintPrivateOutput { field_0 }) => field_0,
             _ => return Err(BridgeError::AttestationFailed.into()),
         };
 
-        // Decrypt and extract amount and note_commitment from encrypted output
-        // In production, this would be parsed from attestation_result.ciphertexts
-        // For now, we'll add this data as account fields
-
         let deposit_intent = &mut ctx.accounts.deposit_intent;
-        let bridge_config = &ctx.accounts.bridge_config;
+        let bridge_config = &mut ctx.accounts.bridge_config;
         let claim_tracker = &mut ctx.accounts.claim_tracker;
 
         // Mark note as claimed to prevent double-spend
@@ -206,70 +249,149 @@ pub mod wzec_bridge {
         claim_tracker.claimed_at = Clock::get()?.unix_timestamp;
         claim_tracker.deposit_id = deposit_intent.deposit_id;
 
-        // Mint wZEC tokens
-        let seeds = &[
-            b"mint-authority".as_ref(),
-            &[bridge_config.mint_authority_bump],
-        ];
-        let signer = &[&seeds[..]];
-
-        let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            MintTo {
-                mint: ctx.accounts.wzec_mint.to_account_info(),
-                to: ctx.accounts.user_token_account.to_account_info(),
-                authority: ctx.accounts.mint_authority.to_account_info(),
-            },
-            signer,
-        );
-
-        token::mint_to(cpi_ctx, deposit_intent.amount)?;
+        // Update on-chain commitment to encrypted balance tree
+        // (The actual balance is encrypted in Arcium, this is just a commitment)
+        bridge_config.balance_merkle_root = balance_update.ciphertexts[0];
+        bridge_config.total_supply_commitment = balance_update.ciphertexts[1];
 
         // Update deposit status
         deposit_intent.status = DepositStatus::Minted as u8;
 
-        emit!(TokensMinted {
+        emit!(PrivateBalanceMinted {
             deposit_id: deposit_intent.deposit_id,
             user: deposit_intent.user,
-            amount: deposit_intent.amount,
-            encrypted_attestation: attestation_result.ciphertexts[0],
+            // NO AMOUNT - keep it private!
+            balance_commitment: balance_update.ciphertexts[0],
+            timestamp: Clock::get()?.unix_timestamp,
         });
 
-        msg!("Minted {} wZEC for deposit {}", deposit_intent.amount, deposit_intent.deposit_id);
+        msg!("Private balance updated for deposit {} (amount hidden)", deposit_intent.deposit_id);
 
         Ok(())
     }
 
     // ========================================================================
-    // DEMO MINT (Admin only, for testing)
+    // PRIVATE TRANSFER (User-to-user encrypted transfer)
     // ========================================================================
 
-    pub fn demo_mint(ctx: Context<DemoMint>, amount: u64) -> Result<()> {
+    pub fn transfer_private(
+        ctx: Context<TransferPrivate>,
+        computation_offset: u64,
+        encrypted_amount: [u8; 32],
+        encrypted_sender_proof: [u8; 32],
+        receiver_pubkey: Pubkey,
+        pub_key: [u8; 32],
+        nonce: u128,
+    ) -> Result<()> {
         require!(
-            ctx.accounts.admin.key() == ctx.accounts.bridge_config.admin,
-            BridgeError::Unauthorized
+            ctx.accounts.sender.key() != receiver_pubkey,
+            BridgeError::InvalidAddress
         );
-        require!(amount > 0, BridgeError::InvalidAmount);
 
-        let seeds = &[
-            b"mint-authority".as_ref(),
-            &[ctx.accounts.bridge_config.mint_authority_bump],
+        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
+
+        // Queue confidential transfer computation
+        let args = vec![
+            Argument::ArcisPubkey(pub_key),
+            Argument::PlaintextU128(nonce),
+            Argument::EncryptedU8(encrypted_amount),
+            Argument::EncryptedU8(encrypted_sender_proof),
+            Argument::PlaintextBytes(ctx.accounts.sender.key().to_bytes().to_vec()),
+            Argument::PlaintextBytes(receiver_pubkey.to_bytes().to_vec()),
         ];
-        let signer = &[&seeds[..]];
 
-        let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            MintTo {
-                mint: ctx.accounts.wzec_mint.to_account_info(),
-                to: ctx.accounts.recipient_token_account.to_account_info(),
-                authority: ctx.accounts.mint_authority.to_account_info(),
-            },
-            signer,
-        );
+        queue_computation(
+            ctx.accounts,
+            computation_offset,
+            args,
+            None,
+            vec![TransferPrivateCallback::callback_ix(&[])],
+            1,
+        )?;
 
-        token::mint_to(cpi_ctx, amount)?;
+        msg!("Private transfer queued (amount hidden)");
 
-        msg!("Demo minted {} wZEC", amount);
+        Ok(())
+    }
+
+    #[arcium_callback(encrypted_ix = "transfer_private")]
+    pub fn transfer_private_callback(
+        ctx: Context<TransferPrivateCallback>,
+        output: ComputationOutputs<TransferPrivateOutput>,
+    ) -> Result<()> {
+        let transfer_result = match output {
+            ComputationOutputs::Success(TransferPrivateOutput { field_0 }) => field_0,
+            _ => return Err(BridgeError::ComputationFailed.into()),
+        };
+
+        // Update balance commitment
+        let bridge_config = &mut ctx.accounts.bridge_config;
+        bridge_config.balance_merkle_root = transfer_result.ciphertexts[0];
+
+        emit!(PrivateTransferCompleted {
+            // No sender/receiver/amount - all private!
+            balance_commitment: transfer_result.ciphertexts[0],
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        msg!("Private transfer completed (details hidden)");
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // GET BALANCE (User queries their own encrypted balance)
+    // ========================================================================
+
+    pub fn get_balance(
+        ctx: Context<GetBalance>,
+        computation_offset: u64,
+        encrypted_user_key: [u8; 32],
+        pub_key: [u8; 32],
+        nonce: u128,
+    ) -> Result<()> {
+        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
+
+        // Queue balance query (encrypted)
+        let args = vec![
+            Argument::ArcisPubkey(pub_key),
+            Argument::PlaintextU128(nonce),
+            Argument::EncryptedU8(encrypted_user_key),
+            Argument::PlaintextBytes(ctx.accounts.user.key().to_bytes().to_vec()),
+        ];
+
+        queue_computation(
+            ctx.accounts,
+            computation_offset,
+            args,
+            None,
+            vec![GetBalanceCallback::callback_ix(&[])],
+            1,
+        )?;
+
+        msg!("Balance query queued for user");
+
+        Ok(())
+    }
+
+    #[arcium_callback(encrypted_ix = "get_balance")]
+    pub fn get_balance_callback(
+        ctx: Context<GetBalanceCallback>,
+        output: ComputationOutputs<GetBalanceOutput>,
+    ) -> Result<()> {
+        let encrypted_balance = match output {
+            ComputationOutputs::Success(GetBalanceOutput { field_0 }) => field_0,
+            _ => return Err(BridgeError::ComputationFailed.into()),
+        };
+
+        // Return encrypted balance (user decrypts client-side)
+        emit!(BalanceQueried {
+            user: ctx.accounts.user.key(),
+            encrypted_balance: encrypted_balance.ciphertexts[0],
+            nonce: encrypted_balance.nonce.to_le_bytes(),
+        });
+
+        msg!("Balance returned (encrypted)");
 
         Ok(())
     }
@@ -278,52 +400,33 @@ pub mod wzec_bridge {
     // REDEMPTION FLOW (wZEC → ZEC)
     // ========================================================================
 
-    /// Burn wZEC and create encrypted withdrawal intent
-    pub fn burn_for_withdrawal(
-        ctx: Context<BurnForWithdrawal>,
+    /// Burn PRIVATE wZEC and create encrypted withdrawal intent
+    /// Amount and destination are fully encrypted
+    pub fn burn_private_for_withdrawal(
+        ctx: Context<BurnPrivateForWithdrawal>,
         computation_offset: u64,
-        amount: u64,
-        zcash_address: Vec<u8>,
-        encrypted_data: [u8; 32],
+        encrypted_amount: [u8; 32],
+        encrypted_zcash_address: [u8; 32],
+        encrypted_user_proof: [u8; 32],
         pub_key: [u8; 32],
         nonce: u128,
     ) -> Result<()> {
-        require!(amount > 0, BridgeError::InvalidAmount);
-        require!(
-            zcash_address.len() > 0 && zcash_address.len() <= 256,
-            BridgeError::InvalidAddress
-        );
-
-        // Validate Zcash UA format
-        require!(
-            zcash_address.starts_with(b"u1") || zcash_address.starts_with(b"utest1"),
-            BridgeError::InvalidAddress
-        );
-
-        // Burn tokens
-        let cpi_ctx = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            Burn {
-                mint: ctx.accounts.wzec_mint.to_account_info(),
-                from: ctx.accounts.user_token_account.to_account_info(),
-                authority: ctx.accounts.user.to_account_info(),
-            },
-        );
-        token::burn(cpi_ctx, amount)?;
-
         // Get burn ID and increment
         let bridge_config = &mut ctx.accounts.bridge_config;
         let burn_id = bridge_config.withdrawal_nonce;
         bridge_config.withdrawal_nonce += 1;
 
-        // Queue confidential burn intent creation
+        // Queue confidential burn (checks balance, creates burn intent, all encrypted)
         ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
         
         let args = vec![
             Argument::ArcisPubkey(pub_key),
             Argument::PlaintextU128(nonce),
-            Argument::EncryptedU8(encrypted_data),
+            Argument::EncryptedU8(encrypted_amount),
+            Argument::EncryptedU8(encrypted_zcash_address),
+            Argument::EncryptedU8(encrypted_user_proof),
             Argument::PlaintextU64(burn_id),
+            Argument::PlaintextBytes(ctx.accounts.user.key().to_bytes().to_vec()),
         ];
 
         queue_computation(
@@ -331,42 +434,50 @@ pub mod wzec_bridge {
             computation_offset,
             args,
             None,
-            vec![CreateBurnIntentCallback::callback_ix(&[])],
+            vec![BurnPrivateCallback::callback_ix(&[])],
             1,
         )?;
 
-        msg!("Burn queued: ID {} for {} wZEC", burn_id, amount);
+        msg!("Private burn queued: ID {} (amount and destination hidden)", burn_id);
 
         Ok(())
     }
 
-    #[arcium_callback(encrypted_ix = "create_burn_intent")]
-    pub fn create_burn_intent_callback(
-        ctx: Context<CreateBurnIntentCallback>,
-        output: ComputationOutputs<CreateBurnIntentOutput>,
+    #[arcium_callback(encrypted_ix = "burn_private")]
+    pub fn burn_private_callback(
+        ctx: Context<BurnPrivateCallback>,
+        output: ComputationOutputs<BurnPrivateOutput>,
     ) -> Result<()> {
-        let burn_output = match output {
-            ComputationOutputs::Success(CreateBurnIntentOutput { field_0 }) => field_0,
-            _ => return Err(BridgeError::ComputationFailed.into()),
+        let burn_result = match output {
+            ComputationOutputs::Success(BurnPrivateOutput { field_0 }) => field_0,
+            _ => return Err(BridgeError::InsufficientBalance.into()),
         };
 
-        emit!(BurnIntentCreated {
-            burn_id: 0, // Encrypted in burn_output
-            encrypted_burn_data: burn_output.ciphertexts[0],
-            nonce: burn_output.nonce.to_le_bytes(),
+        // Update balance commitment after burn
+        let bridge_config = &mut ctx.accounts.bridge_config;
+        bridge_config.balance_merkle_root = burn_result.ciphertexts[0];
+        bridge_config.total_supply_commitment = burn_result.ciphertexts[1];
+
+        emit!(PrivateBurnCompleted {
+            burn_id: 0, // Kept private
+            encrypted_burn_data: burn_result.ciphertexts[2],  // Contains amount + address
+            balance_commitment: burn_result.ciphertexts[0],
+            nonce: burn_result.nonce.to_le_bytes(),
+            timestamp: Clock::get()?.unix_timestamp,
         });
 
-        msg!("Burn intent created (encrypted)");
+        msg!("Private burn completed (details hidden)");
 
         Ok(())
     }
 
-    /// MPC nodes call this after broadcasting Zcash TX
-    pub fn finalize_withdrawal(
-        ctx: Context<FinalizeWithdrawal>,
+    /// MPC nodes call this after broadcasting Zcash TX (finalization still encrypted)
+    pub fn finalize_private_withdrawal(
+        ctx: Context<FinalizePrivateWithdrawal>,
         computation_offset: u64,
-        burn_id: u64,
+        encrypted_burn_id: [u8; 32],
         encrypted_txid: [u8; 32],
+        encrypted_mpc_proof: [u8; 32],
         pub_key: [u8; 32],
         nonce: u128,
     ) -> Result<()> {
@@ -375,8 +486,9 @@ pub mod wzec_bridge {
         let args = vec![
             Argument::ArcisPubkey(pub_key),
             Argument::PlaintextU128(nonce),
+            Argument::EncryptedU8(encrypted_burn_id),
             Argument::EncryptedU8(encrypted_txid),
-            Argument::PlaintextU64(burn_id),
+            Argument::EncryptedU8(encrypted_mpc_proof),
         ];
 
         queue_computation(
@@ -384,32 +496,33 @@ pub mod wzec_bridge {
             computation_offset,
             args,
             None,
-            vec![UpdateBurnIntentCallback::callback_ix(&[])],
+            vec![FinalizePrivateWithdrawalCallback::callback_ix(&[])],
             1,
         )?;
 
-        msg!("Withdrawal finalization queued for burn {}", burn_id);
+        msg!("Private withdrawal finalization queued (encrypted)");
 
         Ok(())
     }
 
-    #[arcium_callback(encrypted_ix = "update_burn_intent")]
-    pub fn update_burn_intent_callback(
-        ctx: Context<UpdateBurnIntentCallback>,
-        output: ComputationOutputs<UpdateBurnIntentOutput>,
+    #[arcium_callback(encrypted_ix = "finalize_private_withdrawal")]
+    pub fn finalize_private_withdrawal_callback(
+        ctx: Context<FinalizePrivateWithdrawalCallback>,
+        output: ComputationOutputs<FinalizePrivateWithdrawalOutput>,
     ) -> Result<()> {
-        let update_output = match output {
-            ComputationOutputs::Success(UpdateBurnIntentOutput { field_0 }) => field_0,
+        let finalization = match output {
+            ComputationOutputs::Success(FinalizePrivateWithdrawalOutput { field_0 }) => field_0,
             _ => return Err(BridgeError::ComputationFailed.into()),
         };
 
-        emit!(WithdrawalFinalized {
-            burn_id: 0, // Encrypted in update_output
-            encrypted_txid: update_output.ciphertexts[0],
-            nonce: update_output.nonce.to_le_bytes(),
+        emit!(PrivateWithdrawalFinalized {
+            encrypted_burn_id: finalization.ciphertexts[0],
+            encrypted_txid: finalization.ciphertexts[1],
+            nonce: finalization.nonce.to_le_bytes(),
+            timestamp: Clock::get()?.unix_timestamp,
         });
 
-        msg!("Withdrawal finalized (encrypted)");
+        msg!("Private withdrawal finalized (all details hidden)");
 
         Ok(())
     }
@@ -424,16 +537,21 @@ pub struct BridgeConfig {
     pub bump: u8,
     pub admin: Pubkey,
     pub enclave_authority: Pubkey,
-    pub wzec_mint: Pubkey,
-    pub mint_authority_bump: u8,
+    
+    // PRIVATE BALANCE STATE (no more public SPL mint!)
+    pub arcium_balance_state: Pubkey,      // Arcium account holding encrypted balances
+    pub balance_merkle_root: [u8; 32],     // Commitment to balance tree
+    pub total_supply_commitment: [u8; 32], // Commitment to total supply (encrypted)
+    
     pub withdrawal_nonce: u64,
     pub deposit_nonce: u64,
     pub mpc_quorum_pubkeys: Vec<[u8; 32]>,
-    pub bridge_ufvk: Vec<u8>,  // Full Viewing Key
+    pub bridge_ufvk: Vec<u8>,  // Full Viewing Key for deposit detection
 }
 
 impl BridgeConfig {
-    pub const MAX_SIZE: usize = 8 + 1 + 32 + 32 + 32 + 1 + 8 + 8 + (4 + 32 * 10) + (4 + 512);
+    // Updated size calculation (removed mint fields, added Arcium fields)
+    pub const MAX_SIZE: usize = 8 + 1 + 32 + 32 + 32 + 32 + 32 + 8 + 8 + (4 + 32 * 10) + (4 + 512);
 }
 
 #[account]
@@ -492,25 +610,18 @@ pub struct InitBridge<'info> {
         seeds = [b"bridge-config"],
         bump
     )]
-    pub bridge_config: Account<'info, BridgeConfig>,
+    pub bridge_config: Box<Account<'info, BridgeConfig>>,
 
+    /// Arcium account for encrypted balance state
+    /// CHECK: This will be initialized by Arcium
     #[account(
-        init,
-        payer = payer,
-        mint::decimals = 8,
-        mint::authority = mint_authority,
-    )]
-    pub wzec_mint: Account<'info, Mint>,
-
-    /// CHECK: PDA mint authority
-    #[account(
-        seeds = [b"mint-authority"],
+        mut,
+        seeds = [b"arcium-balance-state"],
         bump
     )]
-    pub mint_authority: UncheckedAccount<'info>,
+    pub arcium_balance_state: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,
-    pub token_program: Program<'info, Token>,
     pub rent: Sysvar<'info, Rent>,
 }
 
@@ -566,10 +677,10 @@ pub struct SetUnifiedAddress<'info> {
     pub deposit_intent: Account<'info, DepositIntent>,
 }
 
-#[queue_computation_accounts("verify_attestation", payer)]
+#[queue_computation_accounts("mint_private", payer)]
 #[derive(Accounts)]
 #[instruction(computation_offset: u64, deposit_id: u64)]
-pub struct MintWithAttestation<'info> {
+pub struct MintPrivateWithAttestation<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
 
@@ -577,7 +688,7 @@ pub struct MintWithAttestation<'info> {
         seeds = [b"bridge-config"],
         bump = bridge_config.bump,
     )]
-    pub bridge_config: Account<'info, BridgeConfig>,
+    pub bridge_config: Box<Account<'info, BridgeConfig>>,
 
     #[account(
         mut,
@@ -588,7 +699,7 @@ pub struct MintWithAttestation<'info> {
         ],
         bump = deposit_intent.bump,
     )]
-    pub deposit_intent: Account<'info, DepositIntent>,
+    pub deposit_intent: Box<Account<'info, DepositIntent>>,
 
     // Arcium accounts
     #[account(mut)]
@@ -602,10 +713,10 @@ pub struct MintWithAttestation<'info> {
         bump,
         address = derive_sign_pda!(),
     )]
-    pub sign_pda_account: Account<'info, SignerAccount>,
+    pub sign_pda_account: Box<Account<'info, SignerAccount>>,
     
     #[account(address = derive_mxe_pda!())]
-    pub mxe_account: Account<'info, MXEAccount>,
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
     
     #[account(mut, address = derive_mempool_pda!())]
     /// CHECK: checked by arcium
@@ -620,32 +731,33 @@ pub struct MintWithAttestation<'info> {
     pub computation_account: UncheckedAccount<'info>,
     
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_VERIFY_ATTESTATION))]
-    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
     
     #[account(mut, address = derive_cluster_pda!(mxe_account, BridgeError::ClusterNotSet))]
-    pub cluster_account: Account<'info, Cluster>,
+    pub cluster_account: Box<Account<'info, Cluster>>,
     
     #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
-    pub pool_account: Account<'info, FeePool>,
+    pub pool_account: Box<Account<'info, FeePool>>,
     
     #[account(address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
-    pub clock_account: Account<'info, ClockAccount>,
+    pub clock_account: Box<Account<'info, ClockAccount>>,
     
     pub system_program: Program<'info, System>,
     pub arcium_program: Program<'info, Arcium>,
 }
 
-#[callback_accounts("verify_attestation")]
+#[callback_accounts("mint_private")]
 #[derive(Accounts)]
-pub struct VerifyAttestationCallback<'info> {
+pub struct MintPrivateCallback<'info> {
     #[account(mut)]
-    pub deposit_intent: Account<'info, DepositIntent>,
+    pub deposit_intent: Box<Account<'info, DepositIntent>>,
 
     #[account(
+        mut,
         seeds = [b"bridge-config"],
         bump = bridge_config.bump,
     )]
-    pub bridge_config: Account<'info, BridgeConfig>,
+    pub bridge_config: Box<Account<'info, BridgeConfig>>,
 
     #[account(
         init,
@@ -653,76 +765,181 @@ pub struct VerifyAttestationCallback<'info> {
         space = ClaimTracker::SIZE,
         seeds = [
             b"claim-tracker",
-            deposit_intent.key().as_ref()
+            deposit_intent.note_commitment.as_ref()
         ],
         bump
     )]
-    pub claim_tracker: Account<'info, ClaimTracker>,
-
-    /// CHECK: PDA mint authority
-    #[account(
-        seeds = [b"mint-authority"],
-        bump = bridge_config.mint_authority_bump,
-    )]
-    pub mint_authority: UncheckedAccount<'info>,
-
-    #[account(
-        mut,
-        address = bridge_config.wzec_mint,
-    )]
-    pub wzec_mint: Account<'info, Mint>,
-
-    #[account(mut)]
-    pub user_token_account: Account<'info, TokenAccount>,
+    pub claim_tracker: Box<Account<'info, ClaimTracker>>,
 
     #[account(mut)]
     pub payer: Signer<'info>,
 
-    pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
     pub arcium_program: Program<'info, Arcium>,
     
-    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_VERIFY_ATTESTATION))]
-    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_MINT_PRIVATE))]
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
     
     #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
     /// CHECK: checked by constraint
     pub instructions_sysvar: AccountInfo<'info>,
 }
 
+#[queue_computation_accounts("transfer_private", payer)]
 #[derive(Accounts)]
-pub struct DemoMint<'info> {
-    pub admin: Signer<'info>,
+#[instruction(computation_offset: u64)]
+pub struct TransferPrivate<'info> {
+    #[account(mut)]
+    pub sender: Signer<'info>,
 
     #[account(
         seeds = [b"bridge-config"],
         bump = bridge_config.bump,
     )]
-    pub bridge_config: Account<'info, BridgeConfig>,
+    pub bridge_config: Box<Account<'info, BridgeConfig>>,
 
-    /// CHECK: PDA mint authority
-    #[account(
-        seeds = [b"mint-authority"],
-        bump = bridge_config.mint_authority_bump,
-    )]
-    pub mint_authority: UncheckedAccount<'info>,
-
-    #[account(
-        mut,
-        address = bridge_config.wzec_mint,
-    )]
-    pub wzec_mint: Account<'info, Mint>,
-
+    // Arcium accounts
     #[account(mut)]
-    pub recipient_token_account: Account<'info, TokenAccount>,
-
-    pub token_program: Program<'info, Token>,
+    pub payer: Signer<'info>,
+    
+    #[account(
+        init_if_needed,
+        space = 9,
+        payer = payer,
+        seeds = [&SIGN_PDA_SEED],
+        bump,
+        address = derive_sign_pda!(),
+    )]
+    pub sign_pda_account: Box<Account<'info, SignerAccount>>,
+    
+    #[account(address = derive_mxe_pda!())]
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    
+    #[account(mut, address = derive_mempool_pda!())]
+    /// CHECK: checked by arcium
+    pub mempool_account: UncheckedAccount<'info>,
+    
+    #[account(mut, address = derive_execpool_pda!())]
+    /// CHECK: checked by arcium
+    pub executing_pool: UncheckedAccount<'info>,
+    
+    #[account(mut, address = derive_comp_pda!(computation_offset))]
+    /// CHECK: checked by arcium
+    pub computation_account: UncheckedAccount<'info>,
+    
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_TRANSFER_PRIVATE))]
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
+    
+    #[account(mut, address = derive_cluster_pda!(mxe_account, BridgeError::ClusterNotSet))]
+    pub cluster_account: Box<Account<'info, Cluster>>,
+    
+    #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
+    pub pool_account: Box<Account<'info, FeePool>>,
+    
+    #[account(address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
+    pub clock_account: Box<Account<'info, ClockAccount>>,
+    
+    pub system_program: Program<'info, System>,
+    pub arcium_program: Program<'info, Arcium>,
 }
 
-#[queue_computation_accounts("create_burn_intent", payer)]
+#[callback_accounts("transfer_private")]
+#[derive(Accounts)]
+pub struct TransferPrivateCallback<'info> {
+    #[account(
+        mut,
+        seeds = [b"bridge-config"],
+        bump = bridge_config.bump,
+    )]
+    pub bridge_config: Box<Account<'info, BridgeConfig>>,
+
+    pub arcium_program: Program<'info, Arcium>,
+    
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_TRANSFER_PRIVATE))]
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
+    
+    #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
+    /// CHECK: checked by constraint
+    pub instructions_sysvar: AccountInfo<'info>,
+}
+
+#[queue_computation_accounts("get_balance", payer)]
 #[derive(Accounts)]
 #[instruction(computation_offset: u64)]
-pub struct BurnForWithdrawal<'info> {
+pub struct GetBalance<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    #[account(
+        seeds = [b"bridge-config"],
+        bump = bridge_config.bump,
+    )]
+    pub bridge_config: Box<Account<'info, BridgeConfig>>,
+
+    // Arcium accounts
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    
+    #[account(
+        init_if_needed,
+        space = 9,
+        payer = payer,
+        seeds = [&SIGN_PDA_SEED],
+        bump,
+        address = derive_sign_pda!(),
+    )]
+    pub sign_pda_account: Box<Account<'info, SignerAccount>>,
+    
+    #[account(address = derive_mxe_pda!())]
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    
+    #[account(mut, address = derive_mempool_pda!())]
+    /// CHECK: checked by arcium
+    pub mempool_account: UncheckedAccount<'info>,
+    
+    #[account(mut, address = derive_execpool_pda!())]
+    /// CHECK: checked by arcium
+    pub executing_pool: UncheckedAccount<'info>,
+    
+    #[account(mut, address = derive_comp_pda!(computation_offset))]
+    /// CHECK: checked by arcium
+    pub computation_account: UncheckedAccount<'info>,
+    
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_GET_BALANCE))]
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
+    
+    #[account(mut, address = derive_cluster_pda!(mxe_account, BridgeError::ClusterNotSet))]
+    pub cluster_account: Box<Account<'info, Cluster>>,
+    
+    #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
+    pub pool_account: Box<Account<'info, FeePool>>,
+    
+    #[account(address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
+    pub clock_account: Box<Account<'info, ClockAccount>>,
+    
+    pub system_program: Program<'info, System>,
+    pub arcium_program: Program<'info, Arcium>,
+}
+
+#[callback_accounts("get_balance")]
+#[derive(Accounts)]
+pub struct GetBalanceCallback<'info> {
+    pub user: AccountInfo<'info>,
+
+    pub arcium_program: Program<'info, Arcium>,
+    
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_GET_BALANCE))]
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
+    
+    #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
+    /// CHECK: checked by constraint
+    pub instructions_sysvar: AccountInfo<'info>,
+}
+
+#[queue_computation_accounts("burn_private", payer)]
+#[derive(Accounts)]
+#[instruction(computation_offset: u64)]
+pub struct BurnPrivateForWithdrawal<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
 
@@ -731,22 +948,7 @@ pub struct BurnForWithdrawal<'info> {
         seeds = [b"bridge-config"],
         bump = bridge_config.bump,
     )]
-    pub bridge_config: Account<'info, BridgeConfig>,
-
-    #[account(
-        mut,
-        associated_token::mint = wzec_mint,
-        associated_token::authority = user,
-    )]
-    pub user_token_account: Account<'info, TokenAccount>,
-
-    #[account(
-        mut,
-        address = bridge_config.wzec_mint,
-    )]
-    pub wzec_mint: Account<'info, Mint>,
-
-    pub token_program: Program<'info, Token>,
+    pub bridge_config: Box<Account<'info, BridgeConfig>>,
 
     // Arcium accounts
     #[account(mut)]
@@ -760,10 +962,10 @@ pub struct BurnForWithdrawal<'info> {
         bump,
         address = derive_sign_pda!(),
     )]
-    pub sign_pda_account: Account<'info, SignerAccount>,
+    pub sign_pda_account: Box<Account<'info, SignerAccount>>,
     
     #[account(address = derive_mxe_pda!())]
-    pub mxe_account: Account<'info, MXEAccount>,
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
     
     #[account(mut, address = derive_mempool_pda!())]
     /// CHECK: checked by arcium
@@ -777,39 +979,46 @@ pub struct BurnForWithdrawal<'info> {
     /// CHECK: checked by arcium
     pub computation_account: UncheckedAccount<'info>,
     
-    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_CREATE_BURN))]
-    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_BURN_PRIVATE))]
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
     
     #[account(mut, address = derive_cluster_pda!(mxe_account, BridgeError::ClusterNotSet))]
-    pub cluster_account: Account<'info, Cluster>,
+    pub cluster_account: Box<Account<'info, Cluster>>,
     
     #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
-    pub pool_account: Account<'info, FeePool>,
+    pub pool_account: Box<Account<'info, FeePool>>,
     
     #[account(address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
-    pub clock_account: Account<'info, ClockAccount>,
+    pub clock_account: Box<Account<'info, ClockAccount>>,
     
     pub system_program: Program<'info, System>,
     pub arcium_program: Program<'info, Arcium>,
 }
 
-#[callback_accounts("create_burn_intent")]
+#[callback_accounts("burn_private")]
 #[derive(Accounts)]
-pub struct CreateBurnIntentCallback<'info> {
+pub struct BurnPrivateCallback<'info> {
+    #[account(
+        mut,
+        seeds = [b"bridge-config"],
+        bump = bridge_config.bump,
+    )]
+    pub bridge_config: Box<Account<'info, BridgeConfig>>,
+
     pub arcium_program: Program<'info, Arcium>,
     
-    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_CREATE_BURN))]
-    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_BURN_PRIVATE))]
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
     
     #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
     /// CHECK: checked by constraint
     pub instructions_sysvar: AccountInfo<'info>,
 }
 
-#[queue_computation_accounts("update_burn_intent", payer)]
+#[queue_computation_accounts("finalize_private_withdrawal", payer)]
 #[derive(Accounts)]
 #[instruction(computation_offset: u64)]
-pub struct FinalizeWithdrawal<'info> {
+pub struct FinalizePrivateWithdrawal<'info> {
     #[account(mut)]
     pub mpc_node: Signer<'info>,
 
@@ -817,7 +1026,7 @@ pub struct FinalizeWithdrawal<'info> {
         seeds = [b"bridge-config"],
         bump = bridge_config.bump,
     )]
-    pub bridge_config: Account<'info, BridgeConfig>,
+    pub bridge_config: Box<Account<'info, BridgeConfig>>,
 
     // Arcium accounts
     #[account(mut)]
@@ -831,10 +1040,10 @@ pub struct FinalizeWithdrawal<'info> {
         bump,
         address = derive_sign_pda!(),
     )]
-    pub sign_pda_account: Account<'info, SignerAccount>,
+    pub sign_pda_account: Box<Account<'info, SignerAccount>>,
     
     #[account(address = derive_mxe_pda!())]
-    pub mxe_account: Account<'info, MXEAccount>,
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
     
     #[account(mut, address = derive_mempool_pda!())]
     /// CHECK: checked by arcium
@@ -848,29 +1057,29 @@ pub struct FinalizeWithdrawal<'info> {
     /// CHECK: checked by arcium
     pub computation_account: UncheckedAccount<'info>,
     
-    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_UPDATE_BURN))]
-    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_FINALIZE_WITHDRAWAL))]
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
     
     #[account(mut, address = derive_cluster_pda!(mxe_account, BridgeError::ClusterNotSet))]
-    pub cluster_account: Account<'info, Cluster>,
+    pub cluster_account: Box<Account<'info, Cluster>>,
     
     #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
-    pub pool_account: Account<'info, FeePool>,
+    pub pool_account: Box<Account<'info, FeePool>>,
     
     #[account(address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
-    pub clock_account: Account<'info, ClockAccount>,
+    pub clock_account: Box<Account<'info, ClockAccount>>,
     
     pub system_program: Program<'info, System>,
     pub arcium_program: Program<'info, Arcium>,
 }
 
-#[callback_accounts("update_burn_intent")]
+#[callback_accounts("finalize_private_withdrawal")]
 #[derive(Accounts)]
-pub struct UpdateBurnIntentCallback<'info> {
+pub struct FinalizePrivateWithdrawalCallback<'info> {
     pub arcium_program: Program<'info, Arcium>,
     
-    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_UPDATE_BURN))]
-    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_FINALIZE_WITHDRAWAL))]
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
     
     #[account(address = ::anchor_lang::solana_program::sysvar::instructions::ID)]
     /// CHECK: checked by constraint
@@ -878,9 +1087,9 @@ pub struct UpdateBurnIntentCallback<'info> {
 }
 
 // Computation definition initialization contexts
-#[init_computation_definition_accounts("verify_attestation", payer)]
+#[init_computation_definition_accounts("mint_private", payer)]
 #[derive(Accounts)]
-pub struct InitVerifyAttestationCompDef<'info> {
+pub struct InitMintPrivateCompDef<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     #[account(mut, address = derive_mxe_pda!())]
@@ -892,9 +1101,9 @@ pub struct InitVerifyAttestationCompDef<'info> {
     pub system_program: Program<'info, System>,
 }
 
-#[init_computation_definition_accounts("create_burn_intent", payer)]
+#[init_computation_definition_accounts("transfer_private", payer)]
 #[derive(Accounts)]
-pub struct InitCreateBurnCompDef<'info> {
+pub struct InitTransferPrivateCompDef<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     #[account(mut, address = derive_mxe_pda!())]
@@ -906,9 +1115,23 @@ pub struct InitCreateBurnCompDef<'info> {
     pub system_program: Program<'info, System>,
 }
 
-#[init_computation_definition_accounts("update_burn_intent", payer)]
+#[init_computation_definition_accounts("burn_private", payer)]
 #[derive(Accounts)]
-pub struct InitUpdateBurnCompDef<'info> {
+pub struct InitBurnPrivateCompDef<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(mut, address = derive_mxe_pda!())]
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    #[account(mut)]
+    /// CHECK: checked by arcium
+    pub comp_def_account: UncheckedAccount<'info>,
+    pub arcium_program: Program<'info, Arcium>,
+    pub system_program: Program<'info, System>,
+}
+
+#[init_computation_definition_accounts("get_balance", payer)]
+#[derive(Accounts)]
+pub struct InitGetBalanceCompDef<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     #[account(mut, address = derive_mxe_pda!())]
@@ -938,24 +1161,41 @@ pub struct UnifiedAddressSet {
 }
 
 #[event]
-pub struct TokensMinted {
+pub struct PrivateBalanceMinted {
     pub deposit_id: u64,
     pub user: Pubkey,
-    pub amount: u64,
-    pub encrypted_attestation: [u8; 32],
+    pub balance_commitment: [u8; 32],  // Merkle root, NOT the amount!
+    pub timestamp: i64,
 }
 
 #[event]
-pub struct BurnIntentCreated {
+pub struct PrivateTransferCompleted {
+    pub balance_commitment: [u8; 32],
+    pub timestamp: i64,
+    // NO sender, receiver, or amount - fully private!
+}
+
+#[event]
+pub struct PrivateBurnCompleted {
     pub burn_id: u64,
     pub encrypted_burn_data: [u8; 32],
+    pub balance_commitment: [u8; 32],
     pub nonce: [u8; 16],
+    pub timestamp: i64,
 }
 
 #[event]
-pub struct WithdrawalFinalized {
-    pub burn_id: u64,
+pub struct PrivateWithdrawalFinalized {
+    pub encrypted_burn_id: [u8; 32],
     pub encrypted_txid: [u8; 32],
+    pub nonce: [u8; 16],
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct BalanceQueried {
+    pub user: Pubkey,
+    pub encrypted_balance: [u8; 32],
     pub nonce: [u8; 16],
 }
 
@@ -983,4 +1223,12 @@ pub enum BridgeError {
     ComputationFailed,
     #[msg("Cluster not set")]
     ClusterNotSet,
+    #[msg("Insufficient encrypted balance")]
+    InsufficientBalance,
+    #[msg("Invalid encryption key")]
+    InvalidEncryptionKey,
+    #[msg("Balance proof verification failed")]
+    InvalidBalanceProof,
+    #[msg("Encrypted state corrupted")]
+    CorruptedState,
 }

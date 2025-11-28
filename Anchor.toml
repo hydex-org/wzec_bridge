@@ -9,6 +9,12 @@ skip-lint = false
 [programs.localnet]
 wzec_bridge = "HefTNtytDcQgSQmBpPuwjGipbVcJTMRHnppU9poWRXhD"
 
+[programs.testnet]
+wzec_bridge = "HefTNtytDcQgSQmBpPuwjGipbVcJTMRHnppU9poWRXhD"
+
+[programs.devnet]
+wzec_bridge = "HefTNtytDcQgSQmBpPuwjGipbVcJTMRHnppU9poWRXhD"
+
 [registry]
 url = "https://api.apr.dev"
 
