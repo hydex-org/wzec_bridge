@@ -1,6 +1,6 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
-import { PublicKey } from "@solana/web3.js";
+import { PublicKey, BpfLoader, BPF_LOADER_PROGRAM_ID } from "@solana/web3.js";
 import { WzecBridge } from "../target/types/wzec_bridge";
 import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { randomBytes } from "crypto";
@@ -58,6 +58,21 @@ describe("wzec-bridge", () => {
     owner = readKpJson(`${os.homedir()}/.config/solana/id.json`);
     enclaveAuthority = anchor.web3.Keypair.generate();
     mpcAuthority = anchor.web3.Keypair.generate();
+
+    // Deploy the program (since arcium test doesn't use [[test.genesis]])
+    console.log("Deploying program...");
+    try {
+      const programBuffer = fs.readFileSync("target/deploy/wzec_bridge.so");
+      const deployedProgramId = await deployProgram(
+        provider,
+        programBuffer,
+        program.programId
+      );
+      console.log("Program deployed:", deployedProgramId.toString());
+    } catch (error) {
+      console.error("Failed to deploy program:", error);
+      throw error;
+    }
 
     // Derive PDAs
     [bridgeConfigPda] = PublicKey.findProgramAddressSync(
@@ -298,4 +313,35 @@ function readKpJson(path: string): anchor.web3.Keypair {
   return anchor.web3.Keypair.fromSecretKey(
     new Uint8Array(JSON.parse(file.toString()))
   );
+}
+
+async function deployProgram(
+  provider: anchor.AnchorProvider,
+  programBuffer: Buffer,
+  programId: PublicKey
+): Promise<PublicKey> {
+  // Read the program keypair
+  const programKeypair = readKpJson("target/deploy/wzec_bridge-keypair.json");
+
+  // Verify the keypair matches the expected program ID
+  if (!programKeypair.publicKey.equals(programId)) {
+    throw new Error(
+      `Program keypair mismatch! Expected ${programId.toString()}, got ${programKeypair.publicKey.toString()}`
+    );
+  }
+
+  console.log(`  Loading program ${programId.toString()}...`);
+  console.log(`  Program size: ${programBuffer.length} bytes`);
+
+  // Deploy using BPF loader
+  await BpfLoader.load(
+    provider.connection,
+    (provider.wallet as anchor.Wallet).payer,
+    programKeypair,
+    programBuffer,
+    BPF_LOADER_PROGRAM_ID
+  );
+
+  console.log(`  Program deployed successfully!`);
+  return programId;
 }
