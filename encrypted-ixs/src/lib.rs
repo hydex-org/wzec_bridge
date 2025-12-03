@@ -56,8 +56,7 @@ mod circuits {
     pub struct BurnIntentInput {
         pub user: [u8; 32],           // Solana pubkey
         pub amount: u64,              // Amount in zatoshis
-        pub zcash_address: [u8; 256], // Destination UA (encrypted)
-        pub address_len: u16,         // Actual length of address
+        pub zcash_address_hash: [u8; 32],  // Pre-hashed by caller
     }
 
     /// Output stored encrypted on Solana
@@ -65,8 +64,7 @@ mod circuits {
         pub burn_id: u64,
         pub user: [u8; 32],
         pub amount: u64,
-        pub zcash_address: [u8; 256],
-        pub address_len: u16,
+        pub zcash_address_hash: [u8; 32],  // Hash instead of full 256 bytes
         pub status: u8,               // 0=Pending, 1=Processing, 2=Completed, 3=Failed
         pub zcash_txid: [u8; 32],     // Filled in by update_burn_intent
     }
@@ -80,30 +78,27 @@ mod circuits {
     ) -> Enc<Shared, BurnIntentOutput> {
         let input = input_ctxt.to_arcis();
         
-        // Validate address length
-        let is_valid_len = input.address_len >= 4 && input.address_len <= 256;
-        
         // Validate amount
         let is_valid_amount = input.amount > 0;
+        // Validate hash is non-zero
+        let is_valid_hash = input.zcash_address_hash[0] != 0 
+            || input.zcash_address_hash[1] != 0;
         
-        let result = if is_valid_len && is_valid_amount {
+        let result = if is_valid_amount && is_valid_hash {
             BurnIntentOutput {
                 burn_id,
                 user: input.user,
                 amount: input.amount,
-                zcash_address: input.zcash_address,
-                address_len: input.address_len,
+                zcash_address_hash: input.zcash_address_hash,
                 status: 0, // Pending
                 zcash_txid: [0u8; 32],
             }
         } else {
-            // Return failed intent
             BurnIntentOutput {
                 burn_id,
                 user: input.user,
                 amount: 0,
-                zcash_address: [0u8; 256],
-                address_len: 0,
+                zcash_address_hash: [0u8; 32],
                 status: 3, // Failed
                 zcash_txid: [0u8; 32],
             }
@@ -139,8 +134,7 @@ mod circuits {
                 burn_id: input.current_intent.burn_id,
                 user: input.current_intent.user,
                 amount: input.current_intent.amount,
-                zcash_address: input.current_intent.zcash_address,
-                address_len: input.current_intent.address_len,
+                zcash_address_hash: input.current_intent.zcash_address_hash, // Hash is not updated here
                 status: input.new_status,
                 zcash_txid: input.zcash_txid,
             }

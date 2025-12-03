@@ -6,7 +6,7 @@ const COMP_DEF_OFFSET_VERIFY_ATTESTATION: u32 = comp_def_offset("verify_attestat
 const COMP_DEF_OFFSET_CREATE_BURN_INTENT: u32 = comp_def_offset("create_burn_intent");
 const COMP_DEF_OFFSET_UPDATE_BURN_INTENT: u32 = comp_def_offset("update_burn_intent");
 
-declare_id!("5g1mGYeenrQAqYe1zHu7qVZUrqd7mSXoQdEFh4xv7Ard");
+declare_id!("5PLQ9ZSbYq4qfYic3dCwyr1BR8GMVfCKWsbTan2VWE45");
 
 #[arcium_program]
 pub mod wzec_bridge {

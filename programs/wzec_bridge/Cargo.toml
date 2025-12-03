@@ -20,9 +20,9 @@ custom-heap = []
 custom-panic = []
 
 [dependencies]
-anchor-lang = { version = "0.32.0", features = ["init-if-needed"] }
-anchor-spl = { version = "0.32.0", features = ["idl-build"] }
-arcium-client = { default-features = false, version = "0.4.0" }
+anchor-lang = { version = "0.32.1", features = ["init-if-needed"] }
+anchor-spl = { version = "0.32.1", features = ["token"] }
+arcium-client = { version = "0.4.0", default-features = false }
 arcium-macros = "0.4.0"
 arcium-anchor = "0.4.0"
 
