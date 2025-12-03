@@ -1,19 +1,19 @@
 [toolchain]
-anchor_version = "0.32.1"
+anchor_version = "0.32.0"
 package_manager = "yarn"
 
 [features]
 resolution = true
 skip-lint = false
 
+[programs.devnet]
+wzec_bridge = "2U7PitoW8xjjTHFrJ91TorM7VCEF8dqGd38eHuMq4dLe"
+
 [programs.localnet]
-wzec_bridge = "HefTNtytDcQgSQmBpPuwjGipbVcJTMRHnppU9poWRXhD"
+wzec_bridge = "5g1mGYeenrQAqYe1zHu7qVZUrqd7mSXoQdEFh4xv7Ard"
 
 [programs.testnet]
-wzec_bridge = "HefTNtytDcQgSQmBpPuwjGipbVcJTMRHnppU9poWRXhD"
-
-[programs.devnet]
-wzec_bridge = "HefTNtytDcQgSQmBpPuwjGipbVcJTMRHnppU9poWRXhD"
+wzec_bridge = "2tHn9gZqhPUdqkPaRvj7FCEowqGa4usLcsR3WX7fWnCt"
 
 [registry]
 url = "https://api.apr.dev"
