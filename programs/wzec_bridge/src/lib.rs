@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount, MintTo};
+use anchor_spl::token::{self, Mint, Token, TokenAccount, MintTo, Burn};
 use anchor_spl::associated_token::AssociatedToken;
 declare_id!("B12pxSGTH8bt8LtVcdbEXf2CPpf2sFJuj7SctsFuvcQc");
 
@@ -254,6 +254,127 @@ pub mod wzec_bridge {
         
         Ok(())
     }
+
+    // ========================================================================
+    // WITHDRAWAL FLOW
+    // ========================================================================
+
+    /// User initiates withdrawal by burning sZEC
+    /// Creates a BurnIntent PDA with encrypted Zcash address hash
+    /// 
+    /// Status flow: 0 (Pending) -> 1 (Processing) -> 2 (Completed) or 3 (Failed)
+    pub fn burn_for_withdrawal(
+        ctx: Context<BurnForWithdrawal>,
+        amount: u64,
+        encrypted_zcash_addr_hash: [u8; 32],
+    ) -> Result<()> {
+        let config = &ctx.accounts.bridge_config;
+        let burn_id = config.burn_nonce;
+        
+        // Verify user has enough tokens (implicitly checked by burn)
+        require!(amount > 0, BridgeError::InvalidAmount);
+        
+        // Burn the sZEC tokens from user's account
+        token::burn(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Burn {
+                    mint: ctx.accounts.szec_mint.to_account_info(),
+                    from: ctx.accounts.user_token_account.to_account_info(),
+                    authority: ctx.accounts.user.to_account_info(),
+                },
+            ),
+            amount,
+        )?;
+        
+        // Initialize burn intent
+        let intent = &mut ctx.accounts.burn_intent;
+        intent.bump = ctx.bumps.burn_intent;
+        intent.burn_id = burn_id;
+        intent.user = ctx.accounts.user.key();
+        intent.amount = amount;
+        intent.status = 0; // Pending - waiting for MPC to process
+        intent.encrypted_data_hash = encrypted_zcash_addr_hash;
+        intent.zcash_txid = [0; 32];
+        intent.created_at = Clock::get()?.unix_timestamp;
+        
+        // Update bridge config
+        let config = &mut ctx.accounts.bridge_config;
+        config.burn_nonce += 1;
+        config.total_burned += amount;
+        
+        emit!(BurnIntentCreated { burn_id, user: ctx.accounts.user.key() });
+        emit!(BurnInitiated { 
+            burn_id, 
+            user: ctx.accounts.user.key(), 
+            amount 
+        });
+        
+        msg!("Burn intent #{} created: {} zatoshi", burn_id, amount);
+        
+        Ok(())
+    }
+
+    /// MPC authority finalizes withdrawal after Zcash TX is mined
+    /// Updates BurnIntent with the Zcash transaction ID
+    pub fn finalize_withdrawal(
+        ctx: Context<FinalizeWithdrawal>,
+        zcash_txid: [u8; 32],
+        success: bool,
+    ) -> Result<()> {
+        let config = &ctx.accounts.bridge_config;
+        
+        // Only MPC authority can finalize
+        require!(
+            ctx.accounts.authority.key() == config.mpc_authority,
+            BridgeError::Unauthorized
+        );
+        
+        let intent = &ctx.accounts.burn_intent;
+        
+        // Must be in Pending (0) or Processing (1) state
+        require!(
+            intent.status == 0 || intent.status == 1,
+            BridgeError::InvalidStatus
+        );
+        
+        // Update burn intent
+        let intent = &mut ctx.accounts.burn_intent;
+        intent.zcash_txid = zcash_txid;
+        intent.status = if success { 2 } else { 3 }; // 2 = Completed, 3 = Failed
+        
+        emit!(WithdrawalFinalized { burn_id: intent.burn_id });
+        
+        msg!(
+            "Withdrawal #{} finalized: status={}",
+            intent.burn_id,
+            intent.status
+        );
+        
+        Ok(())
+    }
+
+    /// MPC authority marks burn intent as processing
+    /// Called when MPC nodes start building the Zcash transaction
+    pub fn mark_burn_processing(ctx: Context<MarkBurnProcessing>) -> Result<()> {
+        let config = &ctx.accounts.bridge_config;
+        
+        // Only MPC authority can update status
+        require!(
+            ctx.accounts.authority.key() == config.mpc_authority,
+            BridgeError::Unauthorized
+        );
+        
+        let intent = &ctx.accounts.burn_intent;
+        require!(intent.status == 0, BridgeError::InvalidStatus);
+        
+        let intent = &mut ctx.accounts.burn_intent;
+        intent.status = 1; // Processing
+        
+        msg!("Burn intent #{} marked as processing", intent.burn_id);
+        
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -329,6 +450,7 @@ pub enum BridgeError {
     #[msg("Invalid address")] InvalidAddress,
     #[msg("Attestation failed")] AttestationFailed,
     #[msg("Computation failed")] ComputationFailed,
+    #[msg("Invalid amount")] InvalidAmount,
 }
 
 // ============================================================================
@@ -549,4 +671,79 @@ pub struct MintDirect<'info> {
     
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
+}
+
+// ============================================================================
+// WITHDRAWAL ACCOUNT CONTEXTS
+// ============================================================================
+
+/// User burns sZEC to initiate withdrawal
+#[derive(Accounts)]
+pub struct BurnForWithdrawal<'info> {
+    /// User initiating the withdrawal
+    #[account(mut)]
+    pub user: Signer<'info>,
+    
+    #[account(mut, seeds = [b"bridge-config"], bump = bridge_config.bump)]
+    pub bridge_config: Account<'info, BridgeConfig>,
+    
+    /// Burn intent PDA - stores withdrawal request
+    #[account(
+        init,
+        payer = user,
+        space = BurnIntent::SIZE,
+        seeds = [b"burn-intent", user.key().as_ref(), &bridge_config.burn_nonce.to_le_bytes()],
+        bump
+    )]
+    pub burn_intent: Account<'info, BurnIntent>,
+    
+    #[account(mut, seeds = [b"szec-mint"], bump)]
+    pub szec_mint: Account<'info, Mint>,
+    
+    /// User's token account to burn from
+    #[account(
+        mut,
+        associated_token::mint = szec_mint,
+        associated_token::authority = user,
+    )]
+    pub user_token_account: Account<'info, TokenAccount>,
+    
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+/// MPC authority finalizes withdrawal with Zcash txid
+#[derive(Accounts)]
+pub struct FinalizeWithdrawal<'info> {
+    /// MPC authority
+    pub authority: Signer<'info>,
+    
+    #[account(seeds = [b"bridge-config"], bump = bridge_config.bump)]
+    pub bridge_config: Account<'info, BridgeConfig>,
+    
+    /// Burn intent to finalize
+    #[account(
+        mut,
+        seeds = [b"burn-intent", burn_intent.user.as_ref(), &burn_intent.burn_id.to_le_bytes()],
+        bump = burn_intent.bump
+    )]
+    pub burn_intent: Account<'info, BurnIntent>,
+}
+
+/// MPC authority marks burn as processing
+#[derive(Accounts)]
+pub struct MarkBurnProcessing<'info> {
+    /// MPC authority
+    pub authority: Signer<'info>,
+    
+    #[account(seeds = [b"bridge-config"], bump = bridge_config.bump)]
+    pub bridge_config: Account<'info, BridgeConfig>,
+    
+    /// Burn intent to update
+    #[account(
+        mut,
+        seeds = [b"burn-intent", burn_intent.user.as_ref(), &burn_intent.burn_id.to_le_bytes()],
+        bump = burn_intent.bump
+    )]
+    pub burn_intent: Account<'info, BurnIntent>,
 }
