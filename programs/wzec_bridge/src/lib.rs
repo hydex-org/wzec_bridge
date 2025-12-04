@@ -66,7 +66,7 @@ pub mod wzec_bridge {
         intent.status = 0; // Pending
         intent.amount = 0;
         intent.note_commitment = [0; 32];
-        intent.ua_hash = [0; 32]; // Store hash instead of full UA
+        intent.ua_hash = [0; 32];
         intent.created_at = Clock::get()?.unix_timestamp;
         
         emit!(DepositIntentCreated { deposit_id, user: intent.user });
@@ -75,7 +75,7 @@ pub mod wzec_bridge {
 
     pub fn set_unified_address(
         ctx: Context<SetUnifiedAddress>,
-        ua_hash: [u8; 32], // Hash of the UA (stored off-chain or in enclave)
+        ua_hash: [u8; 32],
         amount: u64,
         note_commitment: [u8; 32],
     ) -> Result<()> {
@@ -133,9 +133,10 @@ pub mod wzec_bridge {
         ctx: Context<VerifyAttestationCallback>,
         output: ComputationOutputs<VerifyAttestationOutput>,
     ) -> Result<()> {
+        // Extract encrypted result - check if first ciphertext byte is non-zero for validity
         let is_valid = match output {
-            ComputationOutputs::Success(VerifyAttestationOutput { field_0 }) => {
-                !field_0.ciphertexts.is_empty() && field_0.ciphertexts[0][0] != 0
+            ComputationOutputs::Success(VerifyAttestationOutput { field_0: o }) => {
+                !o.ciphertexts.is_empty() && o.ciphertexts[0][0] != 0
             }
             _ => false,
         };
@@ -198,7 +199,7 @@ pub mod wzec_bridge {
         burn_intent.user = ctx.accounts.user.key();
         burn_intent.amount = amount;
         burn_intent.status = 0; // Pending
-        burn_intent.encrypted_data_hash = [0; 32]; // Will be filled by callback
+        burn_intent.encrypted_data_hash = [0; 32];
         burn_intent.zcash_txid = [0; 32];
         burn_intent.created_at = Clock::get()?.unix_timestamp;
         
@@ -252,7 +253,7 @@ pub mod wzec_bridge {
         
         let burn_intent = &mut ctx.accounts.burn_intent;
         
-        // Store hash of encrypted data (MPC nodes get full data from Arcium)
+        // Store hash of encrypted data
         if !burn_result.ciphertexts.is_empty() {
             burn_intent.encrypted_data_hash = burn_result.ciphertexts[0];
         }
@@ -312,7 +313,7 @@ pub mod wzec_bridge {
         
         let burn_intent = &mut ctx.accounts.burn_intent;
         
-        // Extract zcash_txid from result (first 32 bytes)
+        // Extract zcash_txid from result
         if !update_result.ciphertexts.is_empty() {
             burn_intent.zcash_txid = update_result.ciphertexts[0];
         }
@@ -325,7 +326,7 @@ pub mod wzec_bridge {
 }
 
 // ============================================================================
-// ACCOUNT STRUCTURES (REDUCED SIZE TO FIT STACK)
+// ACCOUNT STRUCTURES
 // ============================================================================
 
 #[account]
@@ -349,7 +350,7 @@ pub struct DepositIntent {
     pub status: u8,
     pub amount: u64,
     pub note_commitment: [u8; 32],
-    pub ua_hash: [u8; 32], // Hash of UA instead of full 256 bytes
+    pub ua_hash: [u8; 32],
     pub created_at: i64,
 }
 
@@ -360,7 +361,7 @@ pub struct BurnIntent {
     pub user: Pubkey,
     pub amount: u64,
     pub status: u8,
-    pub encrypted_data_hash: [u8; 32], // Hash instead of full 512 bytes
+    pub encrypted_data_hash: [u8; 32],
     pub zcash_txid: [u8; 32],
     pub created_at: i64,
 }

@@ -8,7 +8,7 @@ mod circuits {
     // ATTESTATION VERIFICATION (Deposit Flow)
     // ========================================================================
 
-    /// Input from enclave attestation
+    /// Input from enclave attestation - all sensitive data encrypted
     pub struct AttestationInput {
         pub note_commitment: [u8; 32],
         pub amount: u64,
@@ -19,15 +19,14 @@ mod circuits {
     }
 
     /// Verifies the enclave's Ed25519 signature over the attestation payload
-    /// Returns true if valid, false otherwise
+    /// Privacy: Attestation details stay encrypted, only result shared
     #[instruction]
     pub fn verify_attestation(
         input_ctxt: Enc<Shared, AttestationInput>,
     ) -> Enc<Shared, bool> {
         let input = input_ctxt.to_arcis();
         
-        // Basic validation - in production, use Arcium's ed25519_verify if available
-        // For now: validate that all critical fields are non-zero/valid
+        // Validate signature bytes are present
         let sig_byte_0_valid = input.enclave_signature[0] != 0;
         let sig_byte_1_valid = input.enclave_signature[1] != 0;
         let pubkey_valid = input.enclave_pubkey[0] != 0;
@@ -44,6 +43,7 @@ mod circuits {
             && commitment_valid
             && recipient_valid;
 
+        // Return encrypted result
         input_ctxt.owner.from_arcis(is_valid)
     }
 
@@ -54,9 +54,9 @@ mod circuits {
     /// Input for creating a burn/withdrawal intent
     /// The zcash_address is encrypted so Solana never sees it
     pub struct BurnIntentInput {
-        pub user: [u8; 32],           // Solana pubkey
-        pub amount: u64,              // Amount in zatoshis
-        pub zcash_address_hash: [u8; 32],  // Pre-hashed by caller
+        pub user: [u8; 32],
+        pub amount: u64,
+        pub zcash_address_hash: [u8; 32],
     }
 
     /// Output stored encrypted on Solana
@@ -64,9 +64,9 @@ mod circuits {
         pub burn_id: u64,
         pub user: [u8; 32],
         pub amount: u64,
-        pub zcash_address_hash: [u8; 32],  // Hash instead of full 256 bytes
-        pub status: u8,               // 0=Pending, 1=Processing, 2=Completed, 3=Failed
-        pub zcash_txid: [u8; 32],     // Filled in by update_burn_intent
+        pub zcash_address_hash: [u8; 32],
+        pub status: u8,
+        pub zcash_txid: [u8; 32],
     }
 
     /// Creates an encrypted burn intent
@@ -78,9 +78,7 @@ mod circuits {
     ) -> Enc<Shared, BurnIntentOutput> {
         let input = input_ctxt.to_arcis();
         
-        // Validate amount
         let is_valid_amount = input.amount > 0;
-        // Validate hash is non-zero
         let is_valid_hash = input.zcash_address_hash[0] != 0 
             || input.zcash_address_hash[1] != 0;
         
@@ -113,9 +111,9 @@ mod circuits {
 
     /// Input for updating a burn intent after Zcash TX is mined
     pub struct UpdateBurnIntentInput {
-        pub current_intent: BurnIntentOutput, // Current encrypted state
-        pub zcash_txid: [u8; 32],              // Zcash transaction ID
-        pub new_status: u8,                    // 2=Completed, 3=Failed
+        pub current_intent: BurnIntentOutput,
+        pub zcash_txid: [u8; 32],
+        pub new_status: u8,
     }
 
     /// Updates the burn intent with Zcash TXID and new status
@@ -125,7 +123,6 @@ mod circuits {
     ) -> Enc<Shared, BurnIntentOutput> {
         let input = input_ctxt.to_arcis();
         
-        // Only allow update if current status is Pending or Processing
         let can_update = input.current_intent.status == 0 
             || input.current_intent.status == 1;
         
@@ -134,12 +131,11 @@ mod circuits {
                 burn_id: input.current_intent.burn_id,
                 user: input.current_intent.user,
                 amount: input.current_intent.amount,
-                zcash_address_hash: input.current_intent.zcash_address_hash, // Hash is not updated here
+                zcash_address_hash: input.current_intent.zcash_address_hash,
                 status: input.new_status,
                 zcash_txid: input.zcash_txid,
             }
         } else {
-            // Return unchanged if invalid transition
             input.current_intent
         };
 

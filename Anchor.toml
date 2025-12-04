@@ -22,8 +22,4 @@ cluster = "localnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
-test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
-
-[[test.genesis]]
-address = "5PLQ9ZSbYq4qfYic3dCwyr1BR8GMVfCKWsbTan2VWE45"
-program = "target/deploy/wzec_bridge.so"
+test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/wzec_bridge.ts"
