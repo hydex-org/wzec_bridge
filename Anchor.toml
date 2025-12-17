@@ -6,9 +6,10 @@ resolution = true
 skip-lint = false
 
 [programs.devnet]
-wzec_bridge = "5PLQ9ZSbYq4qfYic3dCwyr1BR8GMVfCKWsbTan2VWE45"
+wzec_bridge = "4XACNSk2pxPL4GtXWB7vVTrNUR9vWaoncof1Gw9xszaD"
+
 [programs.localnet]
-wzec_bridge = "5PLQ9ZSbYq4qfYic3dCwyr1BR8GMVfCKWsbTan2VWE45"
+wzec_bridge = "4XACNSk2pxPL4GtXWB7vVTrNUR9vWaoncof1Gw9xszaD"
 
 [programs.testnet]
 wzec_bridge = "2tHn9gZqhPUdqkPaRvj7FCEowqGa4usLcsR3WX7fWnCt"

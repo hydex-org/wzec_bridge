@@ -1,9 +1,23 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, MintTo, Burn};
 use anchor_spl::associated_token::AssociatedToken;
-declare_id!("B12pxSGTH8bt8LtVcdbEXf2CPpf2sFJuj7SctsFuvcQc");
+use arcium_anchor::prelude::*;
 
-#[program]
+declare_id!("4XACNSk2pxPL4GtXWB7vVTrNUR9vWaoncof1Gw9xszaD");
+
+// ============================================================================
+// MXE COMPUTATION OFFSETS
+// ============================================================================
+
+// MXE computation offset for the verify_attestation encrypted instruction
+const COMP_DEF_OFFSET_VERIFY_ATTESTATION: u64 = comp_def_offset("verify_attestation") as u64;
+
+// ============================================================================
+// Phase 2: Arcium MXE integration in progress
+// Direct paths (mint_simple, finalize_withdrawal_direct) still available
+// ============================================================================
+
+#[arcium_program]
 pub mod wzec_bridge {
     use super::*;
 
@@ -28,6 +42,45 @@ pub mod wzec_bridge {
         config.total_burned = 0;
         Ok(())
     }
+
+    /// Update authorities - admin only
+    pub fn update_authorities(
+        ctx: Context<UpdateAuthorities>,
+        new_enclave_authority: Pubkey,
+        new_mpc_authority: Pubkey,
+    ) -> Result<()> {
+        let config = &mut ctx.accounts.bridge_config;
+        
+        require!(
+            ctx.accounts.admin.key() == config.admin,
+            BridgeError::Unauthorized
+        );
+        
+        config.enclave_authority = new_enclave_authority;
+        config.mpc_authority = new_mpc_authority;
+        
+        msg!("Authorities updated");
+        msg!("  New enclave: {}", new_enclave_authority);
+        msg!("  New MPC: {}", new_mpc_authority);
+        
+        Ok(())
+    }
+
+    // ========================================================================
+    // ARCIUM MXE COMPUTATION DEFINITION INIT
+    // ========================================================================
+    // 
+    // TODO: init_comp_def requires InitCompDefAccs trait implementation.
+    // Arcium 0.4.0 pattern unclear - needs SDK documentation review.
+    // For now, computation definitions can be initialized via Arcium CLI:
+    //   arcium init-comp-def --program-id <PROGRAM_ID> --offset 0
+    //
+    // pub fn init_verify_attestation_comp_def(
+    //     ctx: Context<InitVerifyAttestationCompDef>,
+    // ) -> Result<()> {
+    //     init_comp_def(ctx.accounts, COMP_DEF_OFFSET_VERIFY_ATTESTATION, None, None)?;
+    //     Ok(())
+    // }
 
     // ========================================================================
     // DEPOSIT FLOW
@@ -54,8 +107,7 @@ pub mod wzec_bridge {
         Ok(())
     }
 
-    /// Enclave creates deposit intent for a user AND sets the unified address in one TX
-    /// This is the main entry point for the deposit flow
+    /// Enclave creates deposit intent for a user
     pub fn create_deposit_for_user(
         ctx: Context<CreateDepositForUser>,
         recipient: Pubkey,
@@ -63,63 +115,34 @@ pub mod wzec_bridge {
     ) -> Result<()> {
         let config = &ctx.accounts.bridge_config;
         
-        // Only enclave authority can create deposits for users
         require!(
-            ctx.accounts.authority.key() == config.enclave_authority ||
-            ctx.accounts.authority.key() == config.mpc_authority,
+            ctx.accounts.authority.key() == config.enclave_authority,
             BridgeError::Unauthorized
         );
         
         let deposit_id = ctx.accounts.bridge_config.deposit_nonce;
         
-        // Initialize deposit intent
         let intent = &mut ctx.accounts.deposit_intent;
         intent.bump = ctx.bumps.deposit_intent;
         intent.deposit_id = deposit_id;
         intent.user = recipient;
-        intent.status = 1; // AddressGenerated (skipping Pending since we set UA immediately)
-        intent.amount = 0; // Will be set on mint
-        intent.note_commitment = [0; 32]; // Will be set on mint
+        intent.status = 1; // AddressGenerated
+        intent.amount = 0;
+        intent.note_commitment = [0; 32];
         intent.ua_hash = ua_hash;
         intent.created_at = Clock::get()?.unix_timestamp;
         
-        // Update config
         let config = &mut ctx.accounts.bridge_config;
         config.deposit_nonce += 1;
         
         emit!(DepositIntentCreated { deposit_id, user: recipient });
         emit!(UnifiedAddressSet { deposit_id });
         
-        msg!("Created deposit #{} for user {} with UA hash", deposit_id, recipient);
-        
-        Ok(())
-    }
-
-    pub fn set_unified_address(
-        ctx: Context<SetUnifiedAddress>,
-        ua_hash: [u8; 32],
-        amount: u64,
-        note_commitment: [u8; 32],
-    ) -> Result<()> {
-        require!(
-            ctx.accounts.authority.key() == ctx.accounts.bridge_config.enclave_authority,
-            BridgeError::Unauthorized
-        );
-        
-        let intent = &mut ctx.accounts.deposit_intent;
-        require!(intent.status == 0, BridgeError::InvalidStatus);
-        
-        intent.ua_hash = ua_hash;
-        intent.amount = amount;
-        intent.note_commitment = note_commitment;
-        intent.status = 1; // AddressGenerated
-        
-        emit!(UnifiedAddressSet { deposit_id: intent.deposit_id });
         Ok(())
     }
 
     /// Simplified mint function for devnet testing
-    /// Just requires MPC authority to sign - no Arcium
+    /// Enclave or MPC authority can mint after detecting Zcash deposit
     pub fn mint_simple(
         ctx: Context<MintSimple>,
         note_commitment: [u8; 32],
@@ -259,22 +282,18 @@ pub mod wzec_bridge {
     // WITHDRAWAL FLOW
     // ========================================================================
 
-    /// User initiates withdrawal by burning sZEC
-    /// Creates a BurnIntent PDA with encrypted Zcash address hash
-    /// 
-    /// Status flow: 0 (Pending) -> 1 (Processing) -> 2 (Completed) or 3 (Failed)
+    /// User burns sZEC to initiate withdrawal
     pub fn burn_for_withdrawal(
         ctx: Context<BurnForWithdrawal>,
         amount: u64,
-        encrypted_zcash_addr_hash: [u8; 32],
+        encrypted_zcash_addr: Vec<u8>,
     ) -> Result<()> {
         let config = &ctx.accounts.bridge_config;
         let burn_id = config.burn_nonce;
         
-        // Verify user has enough tokens (implicitly checked by burn)
         require!(amount > 0, BridgeError::InvalidAmount);
         
-        // Burn the sZEC tokens from user's account
+        // Burn the sZEC tokens
         token::burn(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -287,81 +306,42 @@ pub mod wzec_bridge {
             amount,
         )?;
         
-        // Initialize burn intent
+        // Hash the encrypted data for on-chain reference
+        // Use first 32 bytes as identifier (or pad if shorter)
+        let mut encrypted_data_hash = [0u8; 32];
+        let len = encrypted_zcash_addr.len().min(32);
+        encrypted_data_hash[..len].copy_from_slice(&encrypted_zcash_addr[..len]);
+        
+        // Initialize burn intent PDA
         let intent = &mut ctx.accounts.burn_intent;
         intent.bump = ctx.bumps.burn_intent;
         intent.burn_id = burn_id;
         intent.user = ctx.accounts.user.key();
         intent.amount = amount;
-        intent.status = 0; // Pending - waiting for MPC to process
-        intent.encrypted_data_hash = encrypted_zcash_addr_hash;
+        intent.status = 0; // Pending
+        intent.encrypted_data_hash = encrypted_data_hash;
         intent.zcash_txid = [0; 32];
         intent.created_at = Clock::get()?.unix_timestamp;
         
-        // Update bridge config
+        // Update config
         let config = &mut ctx.accounts.bridge_config;
         config.burn_nonce += 1;
         config.total_burned += amount;
         
         emit!(BurnIntentCreated { burn_id, user: ctx.accounts.user.key() });
-        emit!(BurnInitiated { 
-            burn_id, 
-            user: ctx.accounts.user.key(), 
-            amount 
-        });
+        emit!(BurnInitiated { burn_id, user: ctx.accounts.user.key(), amount });
         
-        msg!("Burn intent #{} created: {} zatoshi", burn_id, amount);
+        msg!("Created burn intent #{} for {} zatoshi", burn_id, amount);
         
         Ok(())
     }
 
-    /// MPC authority finalizes withdrawal after Zcash TX is mined
-    /// Updates BurnIntent with the Zcash transaction ID
-    pub fn finalize_withdrawal(
-        ctx: Context<FinalizeWithdrawal>,
-        zcash_txid: [u8; 32],
-        success: bool,
-    ) -> Result<()> {
-        let config = &ctx.accounts.bridge_config;
-        
-        // Only MPC authority can finalize
-        require!(
-            ctx.accounts.authority.key() == config.mpc_authority,
-            BridgeError::Unauthorized
-        );
-        
-        let intent = &ctx.accounts.burn_intent;
-        
-        // Must be in Pending (0) or Processing (1) state
-        require!(
-            intent.status == 0 || intent.status == 1,
-            BridgeError::InvalidStatus
-        );
-        
-        // Update burn intent
-        let intent = &mut ctx.accounts.burn_intent;
-        intent.zcash_txid = zcash_txid;
-        intent.status = if success { 2 } else { 3 }; // 2 = Completed, 3 = Failed
-        
-        emit!(WithdrawalFinalized { burn_id: intent.burn_id });
-        
-        msg!(
-            "Withdrawal #{} finalized: status={}",
-            intent.burn_id,
-            intent.status
-        );
-        
-        Ok(())
-    }
-
-    /// MPC authority marks burn intent as processing
-    /// Called when MPC nodes start building the Zcash transaction
+    /// Enclave marks burn as processing (before calling MPC for signing)
     pub fn mark_burn_processing(ctx: Context<MarkBurnProcessing>) -> Result<()> {
         let config = &ctx.accounts.bridge_config;
         
-        // Only MPC authority can update status
         require!(
-            ctx.accounts.authority.key() == config.mpc_authority,
+            ctx.accounts.authority.key() == config.enclave_authority,
             BridgeError::Unauthorized
         );
         
@@ -371,10 +351,100 @@ pub mod wzec_bridge {
         let intent = &mut ctx.accounts.burn_intent;
         intent.status = 1; // Processing
         
-        msg!("Burn intent #{} marked as processing", intent.burn_id);
+        Ok(())
+    }
+
+    /// Enclave finalizes withdrawal with Zcash txid
+    pub fn finalize_withdrawal_direct(
+        ctx: Context<FinalizeWithdrawalDirect>,
+        zcash_txid: [u8; 32],
+        success: bool,
+    ) -> Result<()> {
+        let config = &ctx.accounts.bridge_config;
+        
+        require!(
+            ctx.accounts.authority.key() == config.enclave_authority,
+            BridgeError::Unauthorized
+        );
+        
+        let intent = &ctx.accounts.burn_intent;
+        require!(
+            intent.status == 0 || intent.status == 1,
+            BridgeError::InvalidStatus
+        );
+        
+        let intent = &mut ctx.accounts.burn_intent;
+        intent.zcash_txid = zcash_txid;
+        intent.status = if success { 2 } else { 3 };
+        
+        emit!(WithdrawalFinalized { burn_id: intent.burn_id });
+        
+        msg!("Finalized withdrawal #{}", intent.burn_id);
         
         Ok(())
     }
+}
+
+// ============================================================================
+// EVENTS
+// ============================================================================
+
+#[event]
+pub struct DepositIntentCreated {
+    pub deposit_id: u64,
+    pub user: Pubkey,
+}
+
+#[event]
+pub struct UnifiedAddressSet {
+    pub deposit_id: u64,
+}
+
+#[event]
+pub struct DepositMinted {
+    pub deposit_id: u64,
+    pub user: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
+pub struct BurnIntentCreated {
+    pub burn_id: u64,
+    pub user: Pubkey,
+}
+
+#[event]
+pub struct BurnInitiated {
+    pub burn_id: u64,
+    pub user: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
+pub struct WithdrawalFinalized {
+    pub burn_id: u64,
+}
+
+// ============================================================================
+// ERRORS
+// ============================================================================
+
+#[error_code]
+pub enum BridgeError {
+    #[msg("Unauthorized")]
+    Unauthorized,
+    #[msg("Invalid status")]
+    InvalidStatus,
+    #[msg("Invalid amount")]
+    InvalidAmount,
+    #[msg("Invalid address")]
+    InvalidAddress,
+    #[msg("Computation failed")]
+    ComputationFailed,
+    #[msg("Attestation failed")]
+    AttestationFailed,
+    #[msg("Cluster not set")]
+    ClusterNotSet,
 }
 
 // ============================================================================
@@ -394,6 +464,11 @@ pub struct BridgeConfig {
     pub total_burned: u64,
 }
 
+impl BridgeConfig {
+    // 8 (discriminator) + 1 + 32 + 32 + 32 + 32 + 8 + 8 + 8 + 8 = 169
+    pub const SIZE: usize = 8 + 1 + 32 + 32 + 32 + 32 + 8 + 8 + 8 + 8;
+}
+
 #[account]
 pub struct DepositIntent {
     pub bump: u8,
@@ -404,6 +479,11 @@ pub struct DepositIntent {
     pub note_commitment: [u8; 32],
     pub ua_hash: [u8; 32],
     pub created_at: i64,
+}
+
+impl DepositIntent {
+    // 8 (discriminator) + 1 + 8 + 32 + 1 + 8 + 32 + 32 + 8 = 130
+    pub const SIZE: usize = 8 + 1 + 8 + 32 + 1 + 8 + 32 + 32 + 8;
 }
 
 #[account]
@@ -418,6 +498,11 @@ pub struct BurnIntent {
     pub created_at: i64,
 }
 
+impl BurnIntent {
+    // 8 (discriminator) + 1 + 8 + 32 + 8 + 1 + 32 + 32 + 8 = 130
+    pub const SIZE: usize = 8 + 1 + 8 + 32 + 8 + 1 + 32 + 32 + 8;
+}
+
 #[account]
 pub struct ClaimTracker {
     pub bump: u8,
@@ -426,50 +511,8 @@ pub struct ClaimTracker {
     pub claimed_at: i64,
 }
 
-// ============================================================================
-// EVENTS
-// ============================================================================
-
-#[event]
-pub struct DepositIntentCreated { pub deposit_id: u64, pub user: Pubkey }
-#[event]
-pub struct UnifiedAddressSet { pub deposit_id: u64 }
-#[event]
-pub struct DepositMinted { pub deposit_id: u64, pub user: Pubkey, pub amount: u64 }
-#[event]
-pub struct BurnInitiated { pub burn_id: u64, pub user: Pubkey, pub amount: u64 }
-#[event]
-pub struct BurnIntentCreated { pub burn_id: u64, pub user: Pubkey }
-#[event]
-pub struct WithdrawalFinalized { pub burn_id: u64 }
-
-#[error_code]
-pub enum BridgeError {
-    #[msg("Unauthorized")] Unauthorized,
-    #[msg("Invalid status")] InvalidStatus,
-    #[msg("Invalid address")] InvalidAddress,
-    #[msg("Attestation failed")] AttestationFailed,
-    #[msg("Computation failed")] ComputationFailed,
-    #[msg("Invalid amount")] InvalidAmount,
-}
-
-// ============================================================================
-// SIZE IMPLEMENTATIONS
-// ============================================================================
-
-impl BridgeConfig {
-    pub const SIZE: usize = 8 + 1 + 32 + 32 + 32 + 32 + 8 + 8 + 8 + 8;
-}
-
-impl DepositIntent {
-    pub const SIZE: usize = 8 + 1 + 8 + 32 + 1 + 8 + 32 + 32 + 8;
-}
-
-impl BurnIntent {
-    pub const SIZE: usize = 8 + 1 + 8 + 32 + 8 + 1 + 32 + 32 + 8;
-}
-
 impl ClaimTracker {
+    // 8 (discriminator) + 1 + 32 + 8 + 8 = 57
     pub const SIZE: usize = 8 + 1 + 32 + 8 + 8;
 }
 
@@ -507,6 +550,16 @@ pub struct InitBridge<'info> {
 }
 
 #[derive(Accounts)]
+pub struct UpdateAuthorities<'info> {
+    pub admin: Signer<'info>,
+    #[account(mut, seeds = [b"bridge-config"], bump = bridge_config.bump)]
+    pub bridge_config: Account<'info, BridgeConfig>,
+}
+
+// TODO: InitVerifyAttestationCompDef commented out pending Arcium 0.4.0 pattern clarification
+// Computation definitions can be initialized via Arcium CLI instead
+
+#[derive(Accounts)]
 pub struct InitDepositIntent<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
@@ -527,7 +580,7 @@ pub struct InitDepositIntent<'info> {
 #[derive(Accounts)]
 #[instruction(recipient: Pubkey)]
 pub struct CreateDepositForUser<'info> {
-    /// Enclave or MPC authority
+    /// Enclave authority
     pub authority: Signer<'info>,
     
     /// Payer for account creation
@@ -548,19 +601,6 @@ pub struct CreateDepositForUser<'info> {
     pub deposit_intent: Account<'info, DepositIntent>,
     
     pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct SetUnifiedAddress<'info> {
-    pub authority: Signer<'info>,
-    #[account(seeds = [b"bridge-config"], bump = bridge_config.bump)]
-    pub bridge_config: Account<'info, BridgeConfig>,
-    #[account(
-        mut,
-        seeds = [b"deposit-intent", deposit_intent.user.as_ref(), &deposit_intent.deposit_id.to_le_bytes()],
-        bump = deposit_intent.bump
-    )]
-    pub deposit_intent: Account<'info, DepositIntent>,
 }
 
 /// Simplified mint without Arcium MPC (for devnet)
@@ -712,16 +752,16 @@ pub struct BurnForWithdrawal<'info> {
     pub system_program: Program<'info, System>,
 }
 
-/// MPC authority finalizes withdrawal with Zcash txid
+/// Enclave authority marks burn as processing
 #[derive(Accounts)]
-pub struct FinalizeWithdrawal<'info> {
-    /// MPC authority
+pub struct MarkBurnProcessing<'info> {
+    /// Enclave authority (MPC does NO Solana work)
     pub authority: Signer<'info>,
     
     #[account(seeds = [b"bridge-config"], bump = bridge_config.bump)]
     pub bridge_config: Account<'info, BridgeConfig>,
     
-    /// Burn intent to finalize
+    /// Burn intent to update
     #[account(
         mut,
         seeds = [b"burn-intent", burn_intent.user.as_ref(), &burn_intent.burn_id.to_le_bytes()],
@@ -730,16 +770,16 @@ pub struct FinalizeWithdrawal<'info> {
     pub burn_intent: Account<'info, BurnIntent>,
 }
 
-/// MPC authority marks burn as processing
+/// Enclave authority finalizes withdrawal with Zcash txid
 #[derive(Accounts)]
-pub struct MarkBurnProcessing<'info> {
-    /// MPC authority
+pub struct FinalizeWithdrawalDirect<'info> {
+    /// Enclave authority
     pub authority: Signer<'info>,
     
     #[account(seeds = [b"bridge-config"], bump = bridge_config.bump)]
     pub bridge_config: Account<'info, BridgeConfig>,
     
-    /// Burn intent to update
+    /// Burn intent to finalize
     #[account(
         mut,
         seeds = [b"burn-intent", burn_intent.user.as_ref(), &burn_intent.burn_id.to_le_bytes()],
